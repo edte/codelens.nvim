@@ -214,7 +214,7 @@ function M.create_string(counting)
 	local formatted
 
 	if counting.git_authors then
-		if not (cfg.sections.git_authors == nil or (cfg.hide_zero_counts and counting.git_authors.count == 0)) then
+		if not (cfg.sections.git_authors == nil or (counting.git_authors.count == 0)) then
 			formatted = cfg.sections.git_authors(counting.git_authors.latest_author, counting.git_authors.count)
 			text = text == "" and formatted or text .. cfg.separator .. formatted
 		end
