@@ -42,6 +42,7 @@ local defaults = {
 	ignore_filetype = {
 		"prisma",
 		"markdown",
+		"codecompanion",
 	},
 	-- Target Symbol Kinds to show lens information
 	target_symbol_kinds = {
