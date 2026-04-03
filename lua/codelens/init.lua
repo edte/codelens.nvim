@@ -126,8 +126,10 @@ end
 
 function M.requests_done(finished)
 	for _, p in pairs(finished) do
-		if not (p[1] == true and p[2] == true and p[3] == true) then
-			return false
+		for _, v in ipairs(p) do
+			if v ~= true then
+				return false
+			end
 		end
 	end
 	return true
@@ -172,6 +174,16 @@ function M.lsp_support_method(buf, method)
 	return false
 end
 
+function M.has_codelens_provider(buf)
+	for _, client in pairs(lsp.get_clients({ bufnr = buf })) do
+		local cap = client.server_capabilities
+		if cap and cap.codeLensProvider then
+			return true
+		end
+	end
+	return false
+end
+
 function M.create_string(counting)
 	local cfg = M.config
 	local text = ""
@@ -197,10 +209,10 @@ function M.create_string(counting)
 		append_with(counting.reference, cfg.sections.references)
 
 		if text ~= "" then
-			opts[#opts + 1] = { "", "SymbolUsageRounding" }
+			opts[#opts + 1] = { "", "SymbolUsageRounding" }
 			opts[#opts + 1] = { "󰌹 ", "SymbolUsageRef" }
 			opts[#opts + 1] = { cfg.decorator(text), "SymbolUsageContent" }
-			opts[#opts + 1] = { "", "SymbolUsageRounding" }
+			opts[#opts + 1] = { "", "SymbolUsageRounding" }
 			has = true
 		end
 	end
@@ -226,10 +238,10 @@ function M.create_string(counting)
 		end
 
 		if formatted ~= nil then
-			opts[#opts + 1] = { "", "SymbolUsageRounding" }
-			opts[#opts + 1] = { " ", "SymbolUsageImpl" }
+			opts[#opts + 1] = { "", "SymbolUsageRounding" }
+			opts[#opts + 1] = { " ", "SymbolUsageImpl" }
 			opts[#opts + 1] = { cfg.decorator(formatted), "SymbolUsageContent" }
-			opts[#opts + 1] = { "", "SymbolUsageRounding" }
+			opts[#opts + 1] = { "", "SymbolUsageRounding" }
 		end
 	end
 
@@ -311,15 +323,11 @@ function M.display_lines(bufnr, query_results)
 			vim.api.nvim_set_hl(0, "SymbolUsageDef", { fg = h("Type").fg, bg = h("CursorLine").bg, italic = true })
 			vim.api.nvim_set_hl(0, "SymbolUsageImpl", { fg = h("@keyword").fg, bg = h("CursorLine").bg, italic = true })
 
-			-- 定义一个高亮组，设置背景颜色为主题背景色，字体颜色为灰色
 			vim.cmd("highlight MyHighlightGroup guifg=grey guibg=NONE")
 
 			if query.rangeStart.line < vim.api.nvim_buf_line_count(bufnr) then
 				vim.api.nvim_buf_set_extmark(bufnr, ns_id, query.rangeStart.line, 0, {
-					-- virt_lines = virt_lines,
 					virt_text = opts,
-
-					-- virt_lines_above = true,
 					virt_text_pos = "eol",
 				})
 			end
@@ -329,16 +337,19 @@ end
 
 function M.get_recent_editor(start_row, end_row, callback)
 	local file_path = vim.fn.expand("%:p")
+	local file_dir = vim.fn.fnamemodify(file_path, ":h")
 
 	local stdout = vim.loop.new_pipe()
 	if stdout == nil then
+		callback(nil, {})
 		return
 	end
 
 	local authors = {}
 	local most_recent_editor = nil
-	vim.loop.spawn("git", {
+	local handle = vim.loop.spawn("git", {
 		args = { "blame", "-L", start_row .. "," .. end_row, "--incremental", file_path },
+		cwd = file_dir,
 		stdio = { nil, stdout, nil },
 	}, function(_, _)
 		local authors_arr = {}
@@ -347,6 +358,10 @@ function M.get_recent_editor(start_row, end_row, callback)
 		end
 		callback(most_recent_editor, authors_arr)
 	end)
+	if handle == nil then
+		callback(nil, {})
+		return
+	end
 	vim.loop.read_start(stdout, function(err, data)
 		if data == nil then
 			return
@@ -358,7 +373,6 @@ function M.get_recent_editor(start_row, end_row, callback)
 				local key = string.sub(line, 1, space_pos - 1)
 				local val = string.sub(line, space_pos + 1)
 				if key == "author" then
-					-- if key == "author" or key == "committer" then
 					authors[val] = true
 					if most_recent_editor == nil then
 						most_recent_editor = val
@@ -369,6 +383,7 @@ function M.get_recent_editor(start_row, end_row, callback)
 	end)
 end
 
+-- Legacy flow: documentSymbol + references (for servers without codeLens support)
 function M.do_request(symbols)
 	if not (M:is_buf_requesting(symbols.bufnr) == -1) then
 		return
@@ -445,6 +460,207 @@ function M.do_request(symbols)
 	)
 end
 
+-- Legacy fallback when codeLens has no reference data (reuses already-fetched symbols)
+function M.do_request_legacy(bufnr, functions)
+	if not (M:is_buf_requesting(bufnr) == -1) then
+		return
+	else
+		M:set_buf_requesting(bufnr, 0)
+	end
+
+	-- Add query_params to each function
+	for _, query in pairs(functions or {}) do
+		query.query_params = {
+			position = {
+				character = query.selectionRangeEnd.character,
+				line = query.selectionRangeEnd.line,
+			},
+			textDocument = lsp.util.make_text_document_params(),
+		}
+	end
+
+	local finished = {}
+
+	for idx, function_info in pairs(functions or {}) do
+		finished[#finished + 1] = { false, false, false, false }
+
+		local params = function_info.query_params
+		local counting = {}
+
+		if M.config.sections.implements and M.lsp_support_method(bufnr, M.methods[1]) then
+			lsp.buf_request_all(bufnr, M.methods[1], params, function(implements)
+				counting["implementation"] = M.result_count(implements)
+				finished[idx][1] = true
+			end)
+		else
+			finished[idx][1] = true
+		end
+
+		if M.config.sections.definition and M.lsp_support_method(bufnr, M.methods[2]) then
+			lsp.buf_request_all(bufnr, M.methods[2], params, function(definition)
+				counting["definition"] = M.result_count(definition)
+				finished[idx][2] = true
+			end)
+		else
+			finished[idx][2] = true
+		end
+
+		if M.config.sections.references and M.lsp_support_method(bufnr, M.methods[3]) then
+			params.context = { includeDeclaration = M.config.include_declaration }
+			lsp.buf_request_all(bufnr, M.methods[3], params, function(reference)
+				counting["reference"] = M.result_count(reference)
+				finished[idx][3] = true
+			end)
+		else
+			finished[idx][3] = true
+		end
+
+		if M.config.sections.git_authors then
+			M.get_recent_editor(
+				function_info.rangeStart.line + 1,
+				function_info.rangeEnd.line + 1,
+				function(latest_author, authors)
+					counting["git_authors"] = { latest_author = latest_author, count = #authors }
+					finished[idx][4] = true
+				end
+			)
+		else
+			finished[idx][4] = true
+		end
+
+		function_info["counting"] = counting
+	end
+
+	local timer = vim.loop.new_timer()
+	timer:start(
+		0,
+		500,
+		vim.schedule_wrap(function()
+			if M.requests_done(finished) then
+				if timer ~= nil and timer:is_closing() == false then
+					timer:close()
+				end
+				M.display_lines(bufnr, functions)
+				M:set_buf_requesting(bufnr, 1)
+			end
+		end)
+	)
+end
+
+-- Fast path: use LSP codeLens to get reference counts in one request
+function M.do_request_codelens(bufnr)
+	if not (M:is_buf_requesting(bufnr) == -1) then
+		return
+	else
+		M:set_buf_requesting(bufnr, 0)
+	end
+
+	local codelens_done = false
+	local symbols_done = false
+	local codelens_results = {}
+	local symbol_functions = {}
+
+	local params = { textDocument = lsp.util.make_text_document_params() }
+
+	-- Request 1: codeLens (reference counts)
+	lsp.buf_request_all(bufnr, "textDocument/codeLens", params, function(results)
+		for _, res in pairs(results or {}) do
+			for _, lens in pairs(res.result or {}) do
+				if lens.command and lens.command.title and lens.range then
+					-- Only match codeLens that contain reference info
+					if string.find(lens.command.title, "reference") then
+						local count = tonumber(string.match(lens.command.title, "(%d+)"))
+						if count then
+							codelens_results[lens.range.start.line] = count
+						end
+					end
+				end
+			end
+		end
+		codelens_done = true
+	end)
+
+	-- Request 2: documentSymbol (for git blame ranges)
+	lsp.buf_request_all(bufnr, "textDocument/documentSymbol", params, function(document_symbols)
+		symbol_functions = M.get_cur_document_functions(document_symbols)
+		symbols_done = true
+	end)
+
+	-- Wait for both requests, then merge and add git blame
+	local timer = vim.loop.new_timer()
+	timer:start(
+		0,
+		200,
+		vim.schedule_wrap(function()
+			if not (codelens_done and symbols_done) then
+				return
+			end
+
+			-- If codeLens returned no reference data, fallback to legacy path
+			if vim.tbl_isempty(codelens_results) then
+				if timer ~= nil and not timer:is_closing() then
+					timer:close()
+				end
+				M:set_buf_requesting(bufnr, 1)
+				M.do_request_legacy(bufnr, symbol_functions)
+				return
+			end
+
+			-- Build query results by merging codeLens counts with symbol ranges
+			local finished = {}
+			for idx, func_info in ipairs(symbol_functions) do
+				finished[#finished + 1] = { false }
+
+				local counting = {}
+				-- Match codeLens by line number
+				local ref_count = codelens_results[func_info.rangeStart.line]
+					or codelens_results[func_info.selectionRangeStart.line]
+				if ref_count then
+					counting["reference"] = ref_count
+				else
+					counting["reference"] = 0
+				end
+
+				-- Git blame
+				if M.config.sections.git_authors then
+					M.get_recent_editor(
+						func_info.rangeStart.line + 1,
+						func_info.rangeEnd.line + 1,
+						function(latest_author, authors)
+							counting["git_authors"] = { latest_author = latest_author, count = #authors }
+							finished[idx][1] = true
+						end
+					)
+				else
+					finished[idx][1] = true
+				end
+
+				func_info["counting"] = counting
+			end
+
+			-- Stop the merge timer, start git timer
+			if timer ~= nil and not timer:is_closing() then
+				timer:close()
+			end
+
+			local git_timer = vim.loop.new_timer()
+			git_timer:start(
+				0,
+				500,
+				vim.schedule_wrap(function()
+					if M.requests_done(finished) then
+						if git_timer ~= nil and not git_timer:is_closing() then
+							git_timer:close()
+						end
+						M.display_lines(bufnr, symbol_functions)
+						M:set_buf_requesting(bufnr, 1)
+					end
+				end)
+			)
+		end)
+	)
+end
+
 function M.make_params(results)
 	for _, query in pairs(results or {}) do
 		local params = {
@@ -491,6 +707,13 @@ function M.procedure()
 		end
 	end
 
+	-- Fast path: if server declares codeLensProvider capability, use it
+	if M.has_codelens_provider(bufnr) then
+		M.do_request_codelens(bufnr)
+		return
+	end
+
+	-- Legacy path: documentSymbol + per-symbol references
 	local method = "textDocument/documentSymbol"
 	if M.lsp_support_method(bufnr, method) then
 		local params = { textDocument = lsp.util.make_text_document_params() }
