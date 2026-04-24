@@ -347,11 +347,23 @@ function M.get_recent_editor(start_row, end_row, callback)
 
 	local authors = {}
 	local most_recent_editor = nil
-	local handle = vim.loop.spawn("git", {
+	local handle
+	handle = vim.loop.spawn("git", {
 		args = { "blame", "-L", start_row .. "," .. end_row, "--incremental", file_path },
 		cwd = file_dir,
 		stdio = { nil, stdout, nil },
 	}, function(_, _)
+		-- 必须显式关闭 stdout pipe 和 process handle，否则 libuv 不会回收底层 fd
+		-- 每次泄漏 2 个 fd，一个大文件切一次 buffer 会泄漏几百个，最终触发
+		-- (libuv) kqueue(): Too many open files
+		if stdout and not stdout:is_closing() then
+			stdout:read_stop()
+			stdout:close()
+		end
+		if handle and not handle:is_closing() then
+			handle:close()
+		end
+
 		local authors_arr = {}
 		for author_name, _ in pairs(authors) do
 			authors_arr[#authors_arr + 1] = author_name
@@ -359,6 +371,10 @@ function M.get_recent_editor(start_row, end_row, callback)
 		callback(most_recent_editor, authors_arr)
 	end)
 	if handle == nil then
+		-- spawn 失败也要关闭已创建的 pipe
+		if stdout and not stdout:is_closing() then
+			stdout:close()
+		end
 		callback(nil, {})
 		return
 	end
